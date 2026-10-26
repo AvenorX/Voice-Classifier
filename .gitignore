@@ -1,0 +1,14 @@
+dataset/
+.venv/
+__pycache__/
+*.pyc
+.env
+.ipynb_checkpoints/
+
+voxceleb-*.zip
+train-*.zip
+test-*.zip
+vgg16_voxceleb_features.csv
+audio_dataset.csv
+new_distributed_data*.csv
+voxceleb_vectors*.csv

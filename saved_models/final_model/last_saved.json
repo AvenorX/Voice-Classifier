@@ -1,0 +1,10 @@
+{
+  "saved_at": "2026-10-24T15:44:57.377871",
+  "files": [
+    "xgb_model",
+    "scaler",
+    "label_encoder",
+    "power_transformer",
+    "feature_columns"
+  ]
+}
