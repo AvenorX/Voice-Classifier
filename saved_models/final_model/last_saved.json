@@ -1,10 +1,19 @@
 {
-  "saved_at": "2026-10-24T15:44:57.377871",
+  "saved_at": "2026-10-26T18:48:28.447135",
+  "method": "MFCC (40 coefficients: mean + std)",
+  "n_features": 80,
+  "n_classes": 269,
+  "dataset_source": "dataset\\voxceleb-20261023T105654Z-1-001\\voxceleb\\wavs",
+  "top1_accuracy": 0.36911643270024774,
+  "top5_accuracy": 0.5995045417010735,
+  "macro_f1": 0.3584217050049108,
+  "macro_precision": 0.3922979127440094,
+  "macro_recall": 0.36796778190830237,
   "files": [
-    "xgb_model",
-    "scaler",
-    "label_encoder",
-    "power_transformer",
-    "feature_columns"
+    "xgb_model.pkl",
+    "scaler.pkl",
+    "power_transformer.pkl",
+    "label_encoder.pkl",
+    "feature_columns.json"
   ]
 }

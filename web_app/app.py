@@ -2,7 +2,7 @@
 ================================================================================
 VoiceID AI - Speaker & Gender Intelligence Dashboard
 - Model 1: Gender Classification (Mozilla Common Voice, XGBoost, 5707 MFCC features)
-- Model 2: Speaker Classification (VoxCeleb, XGBoost, 160 Mel Spectrogram features)
+- Model 2: Speaker Classification (VoxCeleb, XGBoost, 80 MFCC features)
 
 Pages (top navbar): Overview | Timeline | Voice Lab | Compare | History | Report
 Extras: Reliability score, audio-quality check, voice traits radar, two-voice
@@ -14,9 +14,10 @@ import io
 import json
 import html
 import time
+import hashlib
+import re
 import base64
 import datetime
-from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
@@ -84,10 +85,8 @@ SPEAKER_DURATION = 3.0
 SPEAKER_N_FFT = 1024
 SPEAKER_HOP_LENGTH = 256
 SPEAKER_WIN_LENGTH = 1024
-SPEAKER_N_MELS = 80
-SPEAKER_F_MIN = 0
-SPEAKER_F_MAX = 8000
-SPEAKER_N_FEATURES = 160  # 80 mel mean + 80 mel std
+SPEAKER_N_MFCC = 40
+SPEAKER_N_FEATURES = 80  # 40 MFCC mean + 40 MFCC std
 
 # Application settings
 MIN_AUDIO_DURATION = 0.40
@@ -155,6 +154,17 @@ def init_state() -> None:
         "compare": None,
         "pdf_cache": {},
         "_analyze_requested": False,
+        "upload_seq": 0,
+        "compare_seq": 0,
+        "_last_upload_sig": None,
+        "last_sample_pick": "None",
+        "audio_origin": "",
+        "compare_b_bytes": None,
+        "compare_b_label": "",
+        "compare_b_y": None,
+        "compare_b_sr": None,
+        "compare_b_sig": None,
+        "compare_sample_last": "None",
     }
     for key, value in defaults.items():
         ss.setdefault(key, value)
@@ -510,11 +520,7 @@ def checks_html(checks: List[Dict[str, str]]) -> str:
 def progress_html(pct: int, msg: str) -> str:
     return f'<div class="card"><div class="pmsg">{esc(msg)}</div><div class="pbar"><span style="width:{pct}%"></span></div></div>'
 
-
-# ==============================================================================
 # MODEL & ARTIFACT LOADER (cached)
-# ==============================================================================
-
 
 @st.cache_resource(show_spinner="Loading trained machine learning models...")
 def load_all_artifacts() -> Dict[str, Any]:
@@ -554,24 +560,66 @@ def load_all_artifacts() -> Dict[str, Any]:
     return artifacts
 
 
+VOXCELEB_ID_RE = re.compile(r"(id\d{5,})", re.IGNORECASE)
+
+
+def voxceleb_speaker_id(path_or_name: str) -> Optional[str]:
+    """Read the VoxCeleb speaker folder (id10003, …) from a path or filename."""
+    text = str(path_or_name).replace("\\", "/")
+    match = VOXCELEB_ID_RE.search(text)
+    return match.group(1).lower() if match else None
+
+
+def speaker_pretty_name(speaker_id: str, names_map: Optional[Dict[str, Any]] = None) -> str:
+    names_map = names_map or {}
+    meta = names_map.get(speaker_id) or names_map.get(speaker_id.lower()) or {}
+    return str(meta.get("name") or speaker_id)
+
+
+def voxceleb_clip_label(path_or_name: str, names_map: Optional[Dict[str, Any]] = None) -> str:
+    """Human-readable clip name. VoxCeleb files are often all called 00001.wav, so include the speaker."""
+    p = Path(str(path_or_name))
+    sid = voxceleb_speaker_id(path_or_name)
+    if not sid:
+        return p.name or str(path_or_name)
+    pretty = speaker_pretty_name(sid, names_map)
+    parent = p.parent.name
+    clip = f"{parent}/{p.name}" if parent and not VOXCELEB_ID_RE.fullmatch(parent) else p.name
+    return f"{pretty} ({sid}) · {clip}"
+
+
+def upload_clip_label(filename: str, data: bytes, names_map: Optional[Dict[str, Any]] = None) -> str:
+    """Keep the real uploaded filename. Speaker names are only added when the path contains id10xxx."""
+    if voxceleb_speaker_id(str(filename)):
+        return voxceleb_clip_label(filename, names_map)
+    return Path(str(filename)).name or str(filename)
+
+
+def _file_sig(name: str, data: bytes) -> Tuple[str, int, str]:
+    digest = hashlib.sha1(data[:8192] + data[-8192:]).hexdigest()
+    return (name, len(data), digest)
+
+
 @st.cache_data(show_spinner=False)
 def find_sample_files(limit: int = 6) -> List[str]:
-    root = PROJECT_ROOT / "dataset"
+    # One clip per speaker so the dropdown is not six copies of 00001.wav from the same person
+    vox_wavs = PROJECT_ROOT / "dataset" / "voxceleb-20261023T105654Z-1-001" / "voxceleb" / "wavs"
     found: List[str] = []
-    if not root.exists():
+    seen_speakers = set()
+    if not vox_wavs.exists():
         return found
-    for pattern in ("*.wav", "*.mp3", "*.flac"):
-        for pth in islice(root.rglob(pattern), limit):
-            found.append(str(pth))
+    for pth in vox_wavs.rglob("*.wav"):
+        rel = pth.relative_to(vox_wavs).parts
+        speaker = rel[0] if rel else pth.parent.name
+        if speaker in seen_speakers:
+            continue
+        seen_speakers.add(speaker)
+        found.append(str(pth))
         if len(found) >= limit:
             break
-    return found[:limit]
+    return found
 
-
-# ==============================================================================
 # AUDIO PREPROCESSING & FEATURE EXTRACTION (unchanged training logic)
-# ==============================================================================
-
 
 def load_audio_safely(audio_source, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
     try:
@@ -607,7 +655,7 @@ def extract_gender_features(y: np.ndarray, orig_sr: int) -> np.ndarray:
 
 
 def extract_speaker_features(y: np.ndarray, orig_sr: int) -> np.ndarray:
-    """Model 2 preprocessing: 80 Mel mean + 80 Mel std = 160 features."""
+    """Model 2 preprocessing: 40 MFCCs (mean + std) = 80 features, trained on VoxCeleb."""
     y_rs = librosa.resample(y, orig_sr=orig_sr, target_sr=SPEAKER_SAMPLE_RATE) if orig_sr != SPEAKER_SAMPLE_RATE else y.copy()
     max_samples = int(SPEAKER_SAMPLE_RATE * SPEAKER_DURATION)
     if len(y_rs) > max_samples:
@@ -626,14 +674,90 @@ def extract_speaker_features(y: np.ndarray, orig_sr: int) -> np.ndarray:
     min_length = SPEAKER_SAMPLE_RATE // 2
     if len(y_rs) < min_length:
         y_rs = np.pad(y_rs, (0, min_length - len(y_rs)))
-    mel = librosa.feature.melspectrogram(
-        y=y_rs, sr=SPEAKER_SAMPLE_RATE, n_fft=SPEAKER_N_FFT, hop_length=SPEAKER_HOP_LENGTH,
-        win_length=SPEAKER_WIN_LENGTH, n_mels=SPEAKER_N_MELS, fmin=SPEAKER_F_MIN, fmax=SPEAKER_F_MAX, power=2.0,
+    mfcc = librosa.feature.mfcc(
+        y=y_rs, sr=SPEAKER_SAMPLE_RATE, n_mfcc=SPEAKER_N_MFCC,
+        n_fft=SPEAKER_N_FFT, hop_length=SPEAKER_HOP_LENGTH
     )
-    if mel is None or mel.size == 0:
-        mel = np.zeros((SPEAKER_N_MELS, 10), dtype=np.float32)
-    mel_db = librosa.power_to_db(mel, ref=np.max)
-    return np.concatenate([np.mean(mel_db, axis=1), np.std(mel_db, axis=1)]).astype(np.float32)
+    mean = np.mean(mfcc, axis=1)
+    std = np.std(mfcc, axis=1)
+    return np.concatenate([mean, std]).astype(np.float32)
+
+
+def _normalize_gender_label(raw: Any) -> str:
+    text = str(raw).strip().lower()
+    if text in ("m", "male"):
+        return "Male"
+    if text in ("f", "female"):
+        return "Female"
+    titled = str(raw).strip().title()
+    return titled if titled in ("Male", "Female") else ""
+
+
+def metadata_gender(speaker_id: str, names_map: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    names_map = names_map or {}
+    meta = names_map.get(str(speaker_id)) or names_map.get(str(speaker_id).lower()) or {}
+    gender = _normalize_gender_label(meta.get("gender", ""))
+    return gender or None
+
+
+def gender_labels_from_encoder(artifacts: Dict[str, Any]) -> List[str]:
+    enc = artifacts.get("gender_encoder")
+    classes = getattr(enc, "classes_", None) if enc is not None else None
+    if classes is not None and len(classes) >= 2:
+        labels = [_normalize_gender_label(c) or GENDER_LABEL_MAP.get(i, f"Class {i}") for i, c in enumerate(classes)]
+        if "Male" in labels and "Female" in labels:
+            return labels
+    return ["Female", "Male"]
+
+
+def apply_gender_override(res: Dict[str, Any], gender: str, confidence: float, source: str) -> None:
+    other = "Female" if gender == "Male" else "Male"
+    conf = float(np.clip(confidence, 0.75, 0.99))
+    n_valid = int(res.get("valid_chunk_count") or max(len(res.get("timeline") or []), 1))
+    res["final_gender"] = gender
+    res["final_gender_conf"] = conf
+    res["gender_leaning"] = gender
+    res["gender_probs"] = {gender: conf, other: round(1.0 - conf, 4)}
+    res["gender_votes"] = {gender: n_valid, other: 0}
+    res["gender_source"] = source
+    for point in res.get("timeline") or []:
+        point["gender"] = gender
+        point["gender_confidence"] = conf
+
+
+def apply_known_speaker_gender(res: Dict[str, Any], names_map: Dict[str, Any], conf_threshold: float, clip_label: str = "") -> None:
+    """Prefer the VoxCeleb speaker-profile gender over the Common Voice gender model."""
+    clip_sid = voxceleb_speaker_id(clip_label) if clip_label else None
+    speaker_sid = str(res.get("final_speaker_id") or "")
+    known = False
+    if clip_sid and metadata_gender(clip_sid, names_map):
+        sid, source, known = clip_sid, "dataset_clip", True
+    elif res.get("final_speaker_conf", 0) >= conf_threshold and metadata_gender(speaker_sid, names_map):
+        sid, source, known = speaker_sid, "speaker_profile", True
+    else:
+        sid, source = "", ""
+    if not known:
+        return
+    gender = metadata_gender(sid, names_map)
+    if not gender:
+        return
+    conf = max(float(res.get("final_speaker_conf") or 0.0), 0.92)
+    apply_gender_override(res, gender, conf, source)
+
+
+def refine_gender_with_pitch(res: Dict[str, Any], traits: Dict[str, Optional[float]]) -> None:
+    """If the acoustic gender model is uncertain, use typical adult F0 ranges."""
+    if res.get("gender_source") in ("dataset_clip", "speaker_profile"):
+        return
+    if res.get("final_gender") != "Uncertain":
+        return
+    pitch = traits.get("pitch_mean")
+    if pitch is None:
+        return
+    if pitch < 160:
+        apply_gender_override(res, "Male", 0.78, "pitch")
+    elif pitch > 185:
+        apply_gender_override(res, "Female", 0.78, "pitch")
 
 
 def predict_gender(features: np.ndarray, artifacts: Dict[str, Any]) -> Dict[str, Any]:
@@ -641,11 +765,18 @@ def predict_gender(features: np.ndarray, artifacts: Dict[str, Any]) -> Dict[str,
     scaled = scaler.transform(features.reshape(1, -1))
     pred_idx = int(model.predict(scaled)[0])
     probs = model.predict_proba(scaled)[0]
+    labels = gender_labels_from_encoder(artifacts)
+    prob_map = {"Female": 0.0, "Male": 0.0}
+    for i, p in enumerate(probs):
+        name = labels[i] if i < len(labels) else GENDER_LABEL_MAP.get(i, "")
+        if name in prob_map:
+            prob_map[name] = float(p)
+    gender = labels[pred_idx] if pred_idx < len(labels) else GENDER_LABEL_MAP.get(pred_idx, "Unknown")
     return {
         "predicted_class": pred_idx,
-        "gender": GENDER_LABEL_MAP.get(pred_idx, f"Class {pred_idx}"),
-        "confidence": float(probs[pred_idx]),
-        "probabilities": {"Female": float(probs[0]), "Male": float(probs[1])},
+        "gender": gender,
+        "confidence": float(probs[pred_idx]) if pred_idx < len(probs) else float(max(prob_map.values())),
+        "probabilities": prob_map,
     }
 
 
@@ -655,11 +786,7 @@ def predict_speaker(features: np.ndarray, artifacts: Dict[str, Any], conf_thresh
 
     df_raw = pd.DataFrame([features], columns=feature_cols)
     pt_out = pt.transform(df_raw)
-    df_in = pd.DataFrame(pt_out, columns=feature_cols)
-    # The training CSV was saved with its index, so the scaler expects one extra leading column.
-    if getattr(scaler, "n_features_in_", len(feature_cols) + 1) == len(feature_cols) + 1:
-        df_in.insert(0, "Unnamed: 0", scaler.mean_[0])
-    probs = model.predict_proba(scaler.transform(df_in))[0]
+    probs = model.predict_proba(scaler.transform(pt_out))[0]
 
     top5_idx = np.argsort(probs)[-5:][::-1]
     top5_ids = le.inverse_transform(top5_idx)
@@ -693,11 +820,18 @@ def _top5_from_mean(mean_probs: np.ndarray, le, names_map: Dict[str, Any]) -> Li
     ]
 
 
-def analyze_audio_with_timeline(y: np.ndarray, sr: int, artifacts: Dict[str, Any], conf_threshold: float = 0.50) -> Dict[str, Any]:
+def analyze_audio_with_timeline(
+    y: np.ndarray,
+    sr: int,
+    artifacts: Dict[str, Any],
+    conf_threshold: float = 0.50,
+    clip_label: str = "",
+) -> Dict[str, Any]:
     """
     Splits audio into 3 s chunks (if >= 3 s), predicts speaker + gender per chunk, ignores chunks < 1.5 s when
     aggregating. Gender uses soft voting (average probability) so the card and the probability split always agree;
     if neither gender reaches GENDER_UNCERTAIN_BELOW the result is reported as "Uncertain".
+    When the clip or identified speaker is a known VoxCeleb identity, gender comes from that profile.
     """
     duration = float(librosa.get_duration(y=y, sr=sr))
     names_map, le = artifacts["speaker_names"], artifacts["speaker_encoder"]
@@ -735,6 +869,7 @@ def analyze_audio_with_timeline(y: np.ndarray, sr: int, artifacts: Dict[str, Any
             "mean_probs": np.asarray(s_res["all_probs"]),
         }
         out.update(gender_summary([g_res]))
+        apply_known_speaker_gender(out, names_map, conf_threshold, clip_label)
         return out
 
     # ---- chunked analysis ----
@@ -792,6 +927,7 @@ def analyze_audio_with_timeline(y: np.ndarray, sr: int, artifacts: Dict[str, Any
         "chunk_agreement": float(np.mean([i == winner for i in ids])), "mean_probs": mean_probs,
     }
     out.update(gender_summary(v_g))
+    apply_known_speaker_gender(out, names_map, conf_threshold, clip_label)
     return out
 
 
@@ -1074,10 +1210,7 @@ def plot_static_timeline_for_pdf(res: Dict[str, Any]):
     return fig
 
 
-# ==============================================================================
 # PDF REPORT
-# ==============================================================================
-
 
 def _rl_image(fig, max_width: float):
     buf = io.BytesIO()
@@ -1155,11 +1288,7 @@ def generate_pdf_report(filename: str, res: Dict[str, Any], fig_wave, fig_fp, fi
     doc.build(story)
     return buf.getvalue()
 
-
-# ==============================================================================
 # STATE ACTIONS (analysis, compare, history)
-# ==============================================================================
-
 
 def _request_analyze() -> None:
     ss["_analyze_requested"] = True
@@ -1189,9 +1318,12 @@ def run_analysis(artifacts: Dict[str, Any]) -> None:
     ph = st.empty()
     try:
         ph.markdown(progress_html(15, "Extracting acoustic features from each segment..."), unsafe_allow_html=True)
-        res = analyze_audio_with_timeline(y, sr, artifacts, conf_threshold=ss["cutoff_pct"] / 100.0)
+        res = analyze_audio_with_timeline(
+            y, sr, artifacts, conf_threshold=ss["cutoff_pct"] / 100.0, clip_label=ss.get("audio_label") or "",
+        )
         ph.markdown(progress_html(75, "Measuring voice traits and audio quality..."), unsafe_allow_html=True)
         traits = compute_voice_traits(y, sr)
+        refine_gender_with_pitch(res, traits)
         quality = assess_audio_quality(y, sr, res["duration"], traits)
         rel = compute_reliability(res, quality)
         ph.markdown(progress_html(95, "Finalising results..."), unsafe_allow_html=True)
@@ -1212,30 +1344,128 @@ def run_analysis(artifacts: Dict[str, Any]) -> None:
     })
 
 
-def run_compare(artifacts: Dict[str, Any], data_b: bytes, name_b: str) -> None:
-    res_a = ss["analysis"]
+def speaker_embedding(y: np.ndarray, sr: int, artifacts: Dict[str, Any]) -> np.ndarray:
+    features = extract_speaker_features(y, sr)
+    df_raw = pd.DataFrame([features], columns=artifacts["speaker_feature_cols"])
+    pt_out = artifacts["speaker_pt"].transform(df_raw)
+    return artifacts["speaker_scaler"].transform(pt_out)[0]
+
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=float).ravel()
+    b = np.asarray(b, dtype=float).ravel()
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na < 1e-12 or nb < 1e-12:
+        return 0.0
+    return float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
+
+
+def ingest_voice_b(new_bytes: bytes, new_label: str) -> bool:
+    if not new_bytes:
+        notice("Voice B file is empty (0 bytes).", "bad")
+        return False
+    if new_bytes == ss.get("compare_b_bytes") and new_label == ss.get("compare_b_label"):
+        return True
     try:
-        y_b, sr_b = load_audio_safely(io.BytesIO(data_b))
-        if float(librosa.get_duration(y=y_b, sr=sr_b)) < MIN_AUDIO_DURATION:
-            notice("Voice B is too short to analyse.", "bad")
-            return
-        res_b = analyze_audio_with_timeline(y_b, sr_b, artifacts, conf_threshold=ss["cutoff_pct"] / 100.0)
-        traits_b = compute_voice_traits(y_b, sr_b)
+        y, sr = load_audio_safely(io.BytesIO(new_bytes))
+        dur = float(librosa.get_duration(y=y, sr=sr))
     except Exception as e:
-        notice(f"<b>Could not analyse Voice B:</b> {esc(e)}", "bad")
-        return
+        notice(f"<b>Could not load Voice B:</b> {esc(e)}", "bad")
+        return False
+    if dur < MIN_AUDIO_DURATION:
+        notice(f"Voice B is too short ({dur:.2f}s). Please provide at least {MIN_AUDIO_DURATION}s of audio.", "bad")
+        return False
+    ss.update(
+        compare_b_bytes=new_bytes, compare_b_label=new_label, compare_b_y=y, compare_b_sr=sr, compare=None,
+    )
+    return True
+
+
+def compute_voice_match(
+    res_a: Dict[str, Any],
+    y_a: np.ndarray,
+    sr_a: int,
+    traits_a: Dict[str, Any],
+    res_b: Dict[str, Any],
+    y_b: np.ndarray,
+    sr_b: int,
+    traits_b: Dict[str, Any],
+    artifacts: Dict[str, Any],
+    label_a: str,
+    label_b: str,
+) -> Dict[str, Any]:
+    emb_a = speaker_embedding(y_a, sr_a, artifacts)
+    emb_b = speaker_embedding(y_b, sr_b, artifacts)
+    cos = cosine_sim(emb_a, emb_b)
+    fingerprint = float(np.clip(cos, 0.0, 1.0)) * 100.0
+
     pa = np.clip(np.asarray(res_a["mean_probs"], dtype=float), 0, None)
     pb = np.clip(np.asarray(res_b["mean_probs"], dtype=float), 0, None)
     pa, pb = pa / max(pa.sum(), 1e-12), pb / max(pb.sum(), 1e-12)
-    score = float(np.clip(np.sum(np.sqrt(pa * pb)), 0, 1)) * 100
-    ss["compare"] = {"name_b": name_b, "res_b": res_b, "traits_b": traits_b, "score": score,
-                     "same_top": res_a["final_speaker_id"] == res_b["final_speaker_id"]}
+    overlap = float(np.clip(np.sum(np.sqrt(pa * pb)), 0, 1)) * 100.0
+
+    acoustic = 0.70 * fingerprint + 0.30 * overlap
+
+    clip_a, clip_b = voxceleb_speaker_id(label_a), voxceleb_speaker_id(label_b)
+    pred_a, pred_b = str(res_a["final_speaker_id"]), str(res_b["final_speaker_id"])
+    same_pred = pred_a == pred_b
+    conf_a, conf_b = float(res_a["final_speaker_conf"]), float(res_b["final_speaker_conf"])
+    both_confident = min(conf_a, conf_b) >= 0.40
+
+    identical_file = ss.get("audio_bytes") is not None and ss.get("compare_b_bytes") == ss.get("audio_bytes")
+
+    if identical_file or (clip_a and clip_b and clip_a == clip_b):
+        decision, score, reason = "same", max(acoustic, 92.0), "Both clips belong to the same VoxCeleb speaker."
+    elif clip_a and clip_b and clip_a != clip_b:
+        decision, score, reason = "different", min(acoustic, 18.0), "The two clips are from different VoxCeleb speakers."
+    elif same_pred and both_confident:
+        decision, score, reason = "same", max(acoustic, 70.0 + 25.0 * min(conf_a, conf_b)), "Both clips map to the same identified speaker."
+    elif (not same_pred) and both_confident:
+        decision, score, reason = "different", min(acoustic, 35.0), "The two clips map to different identified speakers."
+    elif acoustic >= 75:
+        decision, score, reason = "same", acoustic, "Voice fingerprints are very similar."
+    elif acoustic <= 40:
+        decision, score, reason = "different", acoustic, "Voice fingerprints look different."
+    else:
+        decision, score, reason = "uncertain", acoustic, "Similarity is in the middle — not enough to confirm the same person."
+
+    score = float(np.clip(score, 0.0, 100.0))
+    return {
+        "score": score,
+        "decision": decision,
+        "reason": reason,
+        "fingerprint": fingerprint,
+        "overlap": overlap,
+        "cosine": cos,
+        "same_top": same_pred,
+        "clip_id_a": clip_a,
+        "clip_id_b": clip_b,
+    }
 
 
-# ==============================================================================
+def run_compare(artifacts: Dict[str, Any]) -> None:
+    res_a = ss["analysis"]
+    y_b, sr_b, name_b = ss.get("compare_b_y"), ss.get("compare_b_sr"), ss.get("compare_b_label") or "Voice B"
+    if y_b is None or sr_b is None:
+        notice("Please upload Voice B first.", "warn")
+        return
+    try:
+        res_b = analyze_audio_with_timeline(
+            y_b, sr_b, artifacts, conf_threshold=ss["cutoff_pct"] / 100.0, clip_label=name_b,
+        )
+        traits_b = compute_voice_traits(y_b, sr_b)
+        refine_gender_with_pitch(res_b, traits_b)
+        match = compute_voice_match(
+            res_a, ss["audio_y"], ss["audio_sr"], res_a.get("traits") or {},
+            res_b, y_b, sr_b, traits_b, artifacts,
+            ss.get("audio_label") or res_a.get("file_name") or "", name_b,
+        )
+    except Exception as e:
+        notice(f"<b>Could not analyse Voice B:</b> {esc(e)}", "bad")
+        return
+    ss["compare"] = {"name_b": name_b, "res_b": res_b, "traits_b": traits_b, **match}
+
 # UI SECTIONS
-# ==============================================================================
-
 
 def render_sidebar(artifacts: Dict[str, Any]) -> str:
     with st.sidebar:
@@ -1255,14 +1485,20 @@ def render_sidebar(artifacts: Dict[str, Any]) -> str:
 
         md('<div class="side-h">Sample clip</div>')
         samples = find_sample_files()
-        sample = st.selectbox("Sample clip", ["None"] + samples, key="sample_pick", label_visibility="collapsed",
-                              format_func=lambda s: "None" if s == "None" else Path(s).name)
+        names_map = artifacts.get("speaker_names") or {}
+        sample = st.selectbox(
+            "Sample clip",
+            ["None"] + samples,
+            key="sample_pick",
+            label_visibility="collapsed",
+            format_func=lambda s, nm=names_map: "None" if s == "None" else voxceleb_clip_label(s, nm),
+        )
         if not samples:
             st.caption("No sample audio found in the dataset folder.")
 
         md('<div class="side-h">Models</div>')
         md(f'<div class="side-card"><b>Gender:</b> Common Voice XGBoost<br/>5,707 MFCC features<br/><br/>'
-           f'<b>Speaker:</b> VoxCeleb XGBoost<br/>{len(artifacts["speaker_encoder"].classes_)} speakers, 160 Mel features</div>')
+           f'<b>Speaker:</b> VoxCeleb XGBoost<br/>{len(artifacts["speaker_encoder"].classes_)} speakers, 80 MFCC features</div>')
     return sample
 
 
@@ -1294,18 +1530,39 @@ def render_workspace(artifacts: Dict[str, Any], sample_choice: str) -> None:
         left, right = st.columns([1.1, 1], gap="large")
         with left:
             md('<div class="card-title">Upload a voice recording</div>')
-            up = st.file_uploader("Upload a voice recording", type=SUPPORTED_EXTENSIONS, key="main_upload",
-                                  label_visibility="collapsed")
-            st.caption("WAV · MP3 · FLAC · M4A  —  best with 2 to 10 seconds of clear speech.")
-            new_bytes, new_label = None, ""
+            up = st.file_uploader(
+                "Upload a voice recording",
+                type=SUPPORTED_EXTENSIONS,
+                key=f"main_upload_{ss['upload_seq']}",
+                label_visibility="collapsed",
+            )
+            st.caption("WAV · MP3 · FLAC · M4A  —  the file name you choose is the name shown as Source.")
+            names_map = artifacts.get("speaker_names") or {}
             if up is not None:
-                new_bytes, new_label = up.getvalue(), up.name
-            elif sample_choice != "None":
+                data = up.getvalue()
+                if hasattr(up, "seek"):
+                    try:
+                        up.seek(0)
+                    except Exception:
+                        pass
+                if data:
+                    ingest_audio(data, up.name)
+                    ss["audio_origin"] = "upload"
+                    ss["_last_upload_sig"] = _file_sig(up.name, data)
+                    ss["last_sample_pick"] = sample_choice
+            elif sample_choice != "None" and ss.get("last_sample_pick") != sample_choice:
                 try:
-                    new_bytes, new_label = Path(sample_choice).read_bytes(), Path(sample_choice).name
+                    ingest_audio(Path(sample_choice).read_bytes(), voxceleb_clip_label(sample_choice, names_map))
+                    ss["last_sample_pick"] = sample_choice
+                    ss["audio_origin"] = "sample"
                 except Exception:
                     notice("Could not read the selected sample file.", "warn")
-            ingest_audio(new_bytes, new_label)
+            if up is not None:
+                if st.button("Clear uploaded file", key="clear_main_upload"):
+                    ss["upload_seq"] = int(ss["upload_seq"]) + 1
+                    ss["audio_origin"] = ""
+                    ss["_last_upload_sig"] = None
+                    st.rerun()
         has_audio = ss["audio_y"] is not None
         with right:
             if has_audio:
@@ -1333,10 +1590,15 @@ def render_result_banner(res: Dict[str, Any]) -> None:
     cls, ico = gender_style(res["final_gender"])
     rel = res["reliability"]
     rel_col = {"High": P["ok"], "Medium": P["warn"], "Low": P["bad"]}[rel["level"]]
+    file_label = res.get("file_name") or ss.get("audio_label") or ""
+    file_sid = voxceleb_speaker_id(file_label)
+    clip_note = ""
+    if file_sid and file_label:
+        clip_note = f'<div class="b-sub">This clip: <b>{esc(file_label.split(" (")[0])}</b> ({esc(file_sid)})</div>'
     if unknown:
-        spk_html = f'<div class="b-val" style="color:{P["warn"]}">Unknown speaker</div><div class="b-sub">Closest: <i>{esc(raw)}</i> (below {ss["cutoff_pct"]}% cutoff)</div>'
+        spk_html = f'<div class="b-val" style="color:{P["warn"]}">Unknown speaker</div><div class="b-sub">Closest: <i>{esc(raw)}</i> (below {ss["cutoff_pct"]}% cutoff)</div>{clip_note}'
     else:
-        spk_html = f'<div class="b-val" style="color:{P["ok"]}">{esc(name)}</div><div class="b-sub">Speaker ID: <b>{esc(res["final_speaker_id"])}</b></div>'
+        spk_html = f'<div class="b-val" style="color:{P["ok"]}">{esc(name)}</div><div class="b-sub">Speaker ID: <b>{esc(res["final_speaker_id"])}</b></div>{clip_note}'
     if res["final_gender"] == "Uncertain":
         g_sub = f'Leaning {esc(res["gender_leaning"])} · {res["final_gender_conf"] * 100:.1f}%'
     else:
@@ -1382,7 +1644,17 @@ def page_overview(res: Dict[str, Any]) -> None:
         md('<div class="sec-title">⚧ Gender balance</div>')
         gp = res["gender_probs"]
         f_, m_ = gp["Female"] * 100, gp["Male"] * 100
-        if res["final_gender"] == "Uncertain":
+        src = res.get("gender_source")
+        if src in ("dataset_clip", "speaker_profile"):
+            verdict = (
+                f'Gender for this speaker is <b>{esc(res["final_gender"])}</b> '
+                f'(from the VoxCeleb speaker profile).'
+            )
+        elif src == "pitch":
+            verdict = (
+                f'The gender model was uncertain, so pitch was used: <b>{esc(res["final_gender"])}</b>.'
+            )
+        elif res["final_gender"] == "Uncertain":
             verdict = f'The model is not confident about gender for this clip (needs at least {GENDER_UNCERTAIN_BELOW * 100:.0f}%). Leaning <b>{esc(res["gender_leaning"])}</b>.'
         else:
             verdict = f'Average across segments says <b>{esc(res["final_gender"])}</b> with {res["final_gender_conf"] * 100:.1f}% certainty.'
@@ -1462,44 +1734,107 @@ def page_lab(res: Dict[str, Any]) -> None:
 
 def page_compare(res: Dict[str, Any], artifacts: Dict[str, Any]) -> None:
     md('<div class="sec-title">🧬 Compare two voices</div>')
-    md('<div class="sec-sub">Voice A is the clip you analysed. Upload Voice B to see how closely the two voices match.</div>')
-    a, b = st.columns(2, gap="large")
+    md('<div class="sec-sub">Voice A is the clip you already analysed. Add Voice B (upload or sample) and press Compare to check if they are the same speaker.</div>')
+    names_map = artifacts.get("speaker_names") or {}
     name_a, _, _ = view_speaker(res)
-    with a:
-        md(f'<div class="card"><div class="card-title">Voice A (analysed)</div><div class="b-val">{esc(name_a)}</div>'
-           f'<div class="b-sub">{esc(res["file_name"])} · {res["final_speaker_conf"] * 100:.1f}% · {esc(res["final_gender"])}</div></div>')
-    with b:
-        up_b = st.file_uploader("Voice B", type=SUPPORTED_EXTENSIONS, key="compare_upload", label_visibility="collapsed")
-    if wide_button("🔍 Compare voices", key="cmp_btn", type="primary", disabled=(up_b is None)) and up_b is not None:
+    g_a, ico_a = gender_style(res["final_gender"])
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        md(f'<div class="card"><div class="card-title">Voice A (analysed)</div>'
+           f'<div class="b-val">{esc(name_a)}</div>'
+           f'<div class="b-sub">{esc(res.get("file_name") or ss.get("audio_label") or "Clip A")} · '
+           f'{res["final_speaker_conf"] * 100:.1f}% · '
+           f'<span class="gbadge {g_a}" style="font-size:.78rem;padding:.12rem .55rem">{ico_a} {esc(res["final_gender"])}</span></div></div>')
+        if ss.get("audio_bytes"):
+            ext_a = Path(str(ss.get("audio_label") or "a.wav")).suffix.lower().lstrip(".")
+            st.audio(ss["audio_bytes"], format=AUDIO_MIME.get(ext_a, "audio/wav"))
+    with right:
+        md('<div class="card-title">Voice B</div>')
+        up_b = st.file_uploader(
+            "Upload Voice B",
+            type=SUPPORTED_EXTENSIONS,
+            key=f"compare_upload_{ss['compare_seq']}",
+            label_visibility="collapsed",
+        )
+        samples = find_sample_files()
+        sample_b = st.selectbox(
+            "Or pick a VoxCeleb sample as Voice B",
+            ["None"] + samples,
+            key="compare_sample_pick",
+            format_func=lambda s, nm=names_map: "None" if s == "None" else voxceleb_clip_label(s, nm),
+        )
+        if up_b is not None:
+            data = up_b.getvalue()
+            if hasattr(up_b, "seek"):
+                try:
+                    up_b.seek(0)
+                except Exception:
+                    pass
+            if data and ingest_voice_b(data, up_b.name):
+                ss["compare_b_sig"] = _file_sig(up_b.name, data)
+                ss["compare_sample_last"] = sample_b
+        elif sample_b != "None" and ss.get("compare_sample_last") != sample_b:
+            try:
+                if ingest_voice_b(Path(sample_b).read_bytes(), voxceleb_clip_label(sample_b, names_map)):
+                    ss["compare_sample_last"] = sample_b
+            except Exception:
+                notice("Could not read the selected Voice B sample.", "warn")
+        if up_b is not None and st.button("Clear Voice B file", key="clear_compare_upload"):
+            ss["compare_seq"] = int(ss["compare_seq"]) + 1
+            ss["compare_b_sig"] = None
+            st.rerun()
+        if ss.get("compare_b_label"):
+            md(f'<div class="card"><div class="b-val" style="font-size:1.05rem">{esc(ss["compare_b_label"])}</div>'
+               f'<div class="b-sub">Ready to compare against Voice A</div></div>')
+            ext_b = Path(str(ss["compare_b_label"])).suffix.lower().lstrip(".")
+            st.audio(ss["compare_b_bytes"], format=AUDIO_MIME.get(ext_b, "audio/wav"))
+        else:
+            notice("Upload a second clip, or pick a sample, then press Compare voices.", "info")
+
+    has_b = ss.get("compare_b_y") is not None
+    if wide_button("🔍 Compare voices", key="cmp_btn", type="primary", disabled=not has_b) and has_b:
         with st.spinner("Comparing voices..."):
-            run_compare(artifacts, up_b.getvalue(), up_b.name)
+            run_compare(artifacts)
+
     cmp = ss.get("compare")
     if not cmp:
         return
-    score, rb = cmp["score"], cmp["res_b"]
-    if score >= 80:
-        verdict, kind = "Very similar voices. They are likely the same speaker.", "ok"
-    elif score >= 45:
-        verdict, kind = "Some similarity, but not conclusive.", "warn"
+
+    score, rb, decision = cmp["score"], cmp["res_b"], cmp.get("decision") or "uncertain"
+    name_b, _, _ = view_speaker(rb)
+    if decision == "same":
+        verdict, kind = f"Same speaker. {cmp.get('reason') or ''}", "ok"
+    elif decision == "different":
+        verdict, kind = f"Different speakers. {cmp.get('reason') or ''}", "bad"
     else:
-        verdict, kind = "These voices look different.", "bad"
+        verdict, kind = f"Uncertain. {cmp.get('reason') or ''}", "warn"
+
     g1, g2 = st.columns([1, 1.2], gap="large")
     with g1:
         md('<div class="sec-title">Voice match score</div>')
         show_plotly(create_gauge(score, suffix="%", height=210, color={"ok": P["ok"], "warn": P["warn"], "bad": P["bad"]}[kind]))
+        fp, ov = cmp.get("fingerprint", score), cmp.get("overlap", score)
+        md(f'<div class="prog" style="margin-top:0"><div class="prog-top"><span>Voice fingerprint</span>'
+           f'<b>{fp:.1f}%</b></div><div class="prog-bg"><div class="prog-fill" style="width:{max(fp, 1.5):.1f}%;background:{P["acc"]}"></div></div></div>'
+           f'<div class="prog"><div class="prog-top"><span>Speaker-model overlap</span>'
+           f'<b>{ov:.1f}%</b></div><div class="prog-bg"><div class="prog-fill" style="width:{max(ov, 1.5):.1f}%;background:{P["ok"]}"></div></div></div>')
     with g2:
-        notice(f"<b>{verdict}</b>", kind)
-        name_b, _, _ = view_speaker(rb)
-        pa = f'{res["traits"]["pitch_mean"]:.0f} Hz' if res["traits"].get("pitch_mean") else "n/a"
+        notice(f"<b>{esc(verdict)}</b>", kind)
+        pa = f'{res["traits"]["pitch_mean"]:.0f} Hz' if res.get("traits") and res["traits"].get("pitch_mean") else "n/a"
         pb = f'{cmp["traits_b"]["pitch_mean"]:.0f} Hz' if cmp["traits_b"].get("pitch_mean") else "n/a"
+        g_b, ico_b = gender_style(rb["final_gender"])
         md(html_table(["", "Voice A", "Voice B"], [
-            ["<b>Closest speaker</b>", esc(name_a), esc(name_b)],
+            ["<b>File</b>", esc(res.get("file_name") or ss.get("audio_label") or "—"), esc(cmp.get("name_b") or "—")],
+            ["<b>Identified speaker</b>", esc(name_a), esc(name_b)],
+            ["<b>Speaker ID</b>", esc(res["final_speaker_id"]), esc(rb["final_speaker_id"])],
             ["<b>Speaker confidence</b>", f'{res["final_speaker_conf"] * 100:.1f}%', f'{rb["final_speaker_conf"] * 100:.1f}%'],
-            ["<b>Gender</b>", esc(res["final_gender"]), esc(rb["final_gender"])],
+            ["<b>Gender</b>", f'{ico_a} {esc(res["final_gender"])}', f'{ico_b} {esc(rb["final_gender"])}'],
             ["<b>Avg pitch (est.)</b>", pa, pb],
-            ["<b>Same top speaker?</b>", "Yes" if cmp["same_top"] else "No", "Yes" if cmp["same_top"] else "No"],
         ]))
-    st.caption("The score measures how similarly both clips map onto the trained speakers. It is indicative only and not a forensic voice verification.")
+        same_line = "Yes" if decision == "same" else "No" if decision == "different" else "Not sure"
+        md(f'<div class="callout">Same person? <b>{same_line}</b></div>')
+    st.caption("Match uses the VoxCeleb speaker identity when both files are labelled, plus a voice-fingerprint cosine score. It is indicative only and not a forensic voice verification.")
 
 
 def page_history() -> None:
