@@ -20,10 +20,10 @@ F_MAX = 8000
 # PATHS
 # =========================
 
-DATASET_ROOT = Path(__file__).resolve().parent / "dataset" / "voxceleb-20261023T105654Z-1-001"
 
-WAV_ROOT = DATASET_ROOT / "voxceleb" / "wavs"
-MEL_ROOT = DATASET_ROOT / "voxceleb" / "mel"
+
+WAV_ROOT = "voxceleb" / "wavs"
+MEL_ROOT = "voxceleb" / "mel"
 
 # =========================
 # MEL FUNCTION

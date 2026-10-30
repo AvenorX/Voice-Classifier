@@ -60,7 +60,7 @@ LOGO_PATH = ASSETS_DIR / "logo.png"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Model 1: Gender Classification
-GENDER_DIR = PROJECT_ROOT / "saved_models"
+GENDER_DIR = PROJECT_ROOT / "saved_models" / "gender"
 GENDER_MODEL_PATH = GENDER_DIR / "xgb_model.pkl"
 GENDER_SCALER_PATH = GENDER_DIR / "scaler.pkl"
 GENDER_ENCODER_PATH = GENDER_DIR / "label_encoder.pkl"
@@ -72,7 +72,7 @@ GENDER_LABEL_MAP = {0: "Female", 1: "Male"}  # as encoded in the training notebo
 GENDER_UNCERTAIN_BELOW = 0.60  # average probability below this -> "Uncertain"
 
 # Model 2: Speaker Classification (XGBoost)
-SPEAKER_DIR = PROJECT_ROOT / "saved_models" / "final_model"
+SPEAKER_DIR = PROJECT_ROOT / "saved_models" / "speaker"
 SPEAKER_MODEL_PATH = SPEAKER_DIR / "xgb_model.pkl"
 SPEAKER_SCALER_PATH = SPEAKER_DIR / "scaler.pkl"
 SPEAKER_PT_PATH = SPEAKER_DIR / "power_transformer.pkl"
@@ -533,7 +533,7 @@ def load_all_artifacts() -> Dict[str, Any]:
     if missing:
         raise FileNotFoundError(
             f"Missing required model artifact(s): {', '.join(missing)}. "
-            "Please verify files exist in saved_models/ and saved_models/final_model/."
+            "Please verify gender files exist in saved_models/gender/ and speaker files exist in saved_models/speaker/."
         )
     artifacts: Dict[str, Any] = {
         "gender_model": joblib.load(GENDER_MODEL_PATH),
@@ -1906,7 +1906,11 @@ def main() -> None:
     try:
         artifacts = load_all_artifacts()
     except Exception as e:
-        notice(f"<b>Failed to load models:</b> {esc(e)}<br/>Make sure the saved models exist in saved_models/ and saved_models/final_model/.", "bad")
+        notice(
+            f"<b>Failed to load models:</b> {esc(e)}<br/>"
+            "Make sure gender files exist in saved_models/gender/ and speaker files exist in saved_models/speaker/.",
+            "bad",
+        )
         st.stop()
 
     sample_choice = render_sidebar(artifacts)
